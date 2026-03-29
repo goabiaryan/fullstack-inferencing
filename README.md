@@ -1,8 +1,8 @@
 # TinyLlama + vLLM on Lambda Cloud (minimal E2E)
 
-GPU inference runs on a **[Lambda Cloud](https://cloud.lambdalabs.com/)** instance. Your **laptop** runs the FastAPI **gateway** (metrics, tracing hooks) and **CrewAI**, talking to vLLM over an **SSH tunnel**.
+GPU inference runs on a **[Lambda Cloud](https://cloud.lambdalabs.com/)** instance. Your **laptop** runs **CrewAI** → **nginx** (load balancer) → the FastAPI **gateway** → vLLM over an **SSH tunnel**.
 
-**You need:** Python 3.10+ on the laptop, a Lambda account, and **Docker** on the laptop if you follow **Steps 13–18** (Prometheus + Grafana). Docker is also used for optional **Jaeger** traces.
+**You need:** Python 3.10+ on the laptop, **nginx** for Steps **12–14**, a Lambda account, and **Docker** if you follow **Steps 16–17** (Prometheus + Grafana). Docker is also used for optional **Jaeger** traces.
 
 ---
 
@@ -155,6 +155,8 @@ Edit **`.env`** with at least:
 - **`VLLM_BASE_URL=http://127.0.0.1:8000`** (no trailing slash; requires Step 7).
 - **`VLLM_SERVER_PROFILE=baseline`**
 
+Keep **`GATEWAY_OPENAI_BASE`** on **`http://127.0.0.1:8780/v1`** as in **`.env.example`** if you will use nginx (Step 12). To skip nginx and point Crew at the gateway only, set **`GATEWAY_USE_LOAD_BALANCER=false`** and **`GATEWAY_OPENAI_BASE=http://127.0.0.1:8765/v1`**.
+
 Optional for **cost metrics** in `.env`: **`LAMBDA_CLOUD_API_KEY=`** (paste key from Lambda dashboard → **API keys**), **`LAMBDA_INSTANCE_TYPE=`** (e.g. `gpu_1x_a10`, or leave empty to infer), **`LAMBDA_COST_USE_API=true`**. Or set **`LAMBDA_COST_USE_API=false`** and use **`GPU_HOURLY_COST_USD`** only. See **`.env.example`**.
 
 Install Python dependencies **on the laptop** (not on Lambda):
@@ -167,7 +169,7 @@ pip install -r requirements.txt
 
 ### Step 10 — On your laptop: start the gateway
 
-Open a **dedicated** tab and keep it open (Steps 6, 7, 10 run until you are done):
+Keep Steps **6** and **7** running. New tab, stay in this tab until you are done:
 
 ```bash
 cd <path-to-your-repo>
@@ -175,60 +177,62 @@ set -a && source .env && set +a
 python gateway.py
 ```
 
-Leave this running. The API is at **`http://127.0.0.1:8765/v1/...`**. Prometheus scrapes **`http://127.0.0.1:9101/metrics`** (started automatically when the app loads — same if you use **`uvicorn gateway:app`**). The app also serves **`http://127.0.0.1:8765/metrics`** for quick checks.
-
-On startup you should see a log line like **`Prometheus scrape URL … :9101/metrics`**. If **`9101`** is already in use, stop the old gateway process or change **`GATEWAY_METRICS_PORT`** in **`.env`** and point **`monitoring/prometheus.yml`** at the new port.
-
-**JSONL logs:** By default the gateway writes **`logs/gateway/gateway_metrics_YYYY-MM-DD.jsonl`** under the repo (gitignored). Set **`GATEWAY_METRICS_LOG_DIR=-`** in **`.env`** to turn that off.
+Gateway listens on **`127.0.0.1:8765`**. Prometheus scrapes **`http://127.0.0.1:9101/metrics`** when the process starts (change **`GATEWAY_METRICS_PORT`** in **`.env`** if **9101** is busy and update **`monitoring/prometheus.yml`**). Optional JSONL: **`logs/gateway/`** (disable with **`GATEWAY_METRICS_LOG_DIR=-`**).
 
 ---
 
-### Step 11 — On your laptop: verify the gateway
+### Step 11 — On your laptop: quick check (gateway port **8765**)
 
-With Step 10 still running, in **another** tab:
+Still with Step **10** running, new tab:
 
 ```bash
 curl -sS http://127.0.0.1:8765/
-```
-
-Expect **`200`** and JSON with **`service`** / **`endpoints`** (opening **http://127.0.0.1:8765/** in a browser is fine).
-
-```bash
 curl -sS http://127.0.0.1:8765/health
-```
-
-Expect **`"status":"ok"`** if `VLLM_BASE_URL` is valid.
-
-```bash
 curl -sS http://127.0.0.1:8765/v1/models
 ```
 
-Expect **`texttinyllama`** in the JSON.
-
-**Optional chat test:**
-
-```bash
-curl -sS "http://127.0.0.1:8765/v1/chat/completions" \
-  -H "Content-Type: application/json" -H "X-Technique: baseline" \
-  -d '{"model":"texttinyllama","messages":[{"role":"user","content":"Say hi in five words."}],"max_tokens":32}'
-```
-
-**Metrics — readable vs raw Prometheus**
-
-The **`/metrics`** page is **Prometheus’ text format**: every metric family repeats **`# HELP`** and **`# TYPE`**, and **histograms** print one line per bucket. That verbosity is **normal** for scrapers, not meant to be read by hand.
-
-- **Human-friendly (this gateway only):** on the **API port** open **`http://127.0.0.1:8765/metrics/summary`** (JSON), **`?format=text`**, or **`?format=html`**. The lightweight server on **`:9101`** exposes **only** **`/metrics`** for Prometheus — use **8765** for the summary.
-- **Raw `llm_gateway_*` only:** `curl -sS http://127.0.0.1:9101/metrics | grep '^llm_gateway_'`
-
-**vLLM engine metrics** (prefill/decode, KV cache, tok/s in the vLLM style) are **not** inside the gateway process. They are exposed by **vLLM** at **`http://127.0.0.1:8000/metrics`** (with your SSH tunnel). Prometheus should scrape that target as **`vllm_tunnel`** (see **`monitoring/prometheus.yml`**). Console log lines from **`vllm serve`** are separate from Prometheus.
-
-After editing **`gateway.py`**, restart the gateway. See **Step 14** for Grafana.
+You want **`200`** on **`/health`** with **`"status":"ok"`** when **`VLLM_BASE_URL`** is correct, and **`texttinyllama`** in **`/v1/models`**.
 
 ---
 
-### Step 12 — On your laptop: run Crew
+### Step 12 — On your laptop: start nginx in front of the gateway
 
-With Steps 6, 7, and 10 still running:
+Run **after** Step **10**. Needs **`nginx`** installed (`nginx -v`). Edit **`monitoring/nginx-gateway-lb.conf`** if you add more **`python gateway.py`** backends on **8766**, etc.
+
+```bash
+cd <path-to-your-repo>/monitoring
+nginx -t -p /tmp -c "$(pwd)/nginx-gateway-lb.conf"
+nginx -p /tmp -c "$(pwd)/nginx-gateway-lb.conf"
+```
+
+Stop later:
+
+```bash
+nginx -s quit -p /tmp -c "<path-to-your-repo>/monitoring/nginx-gateway-lb.conf"
+```
+
+---
+
+### Step 13 — On your laptop: quick check (load balancer **8780**)
+
+With Steps **10** and **12** running:
+
+```bash
+curl -sS http://127.0.0.1:8780/health
+curl -sS http://127.0.0.1:8780/v1/models
+curl -sS "http://127.0.0.1:8780/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "X-Technique: baseline" \
+  -d '{"model":"texttinyllama","messages":[{"role":"user","content":"Say hi in five words."}],"max_tokens":32}'
+```
+
+If **8780** refuses the connection, Step **12** did not start or the config path is wrong. If you get **502**, the gateway on **8765** is not up.
+
+---
+
+### Step 14 — On your laptop: run Crew
+
+Steps **6**, **7**, **10**, **12**, and **13** must be good. **`GATEWAY_OPENAI_BASE`** should stay **`http://127.0.0.1:8780/v1`** unless you turned off the LB in **`.env`**.
 
 ```bash
 cd <path-to-your-repo>
@@ -236,25 +240,23 @@ set -a && source .env && set +a
 python crew.py --technique baseline
 ```
 
-`crew.py` waits for **`GET /v1/models`** via the gateway (up to **`CREW_VLLM_WAIT_S`** seconds) before starting; set **`CREW_VLLM_WAIT_S=0`** in `.env` to skip that wait. Poll interval: **`CREW_VLLM_POLL_S`** (see **`.env.example`**). By default **`CREW_LLM_STREAM=true`**: LiteLLM sends **`"stream": true`** so the gateway uses the **SSE** path and JSONL / **`llm_gateway_stream_inter_chunk_*`** reflect real chunk timing. Set **`CREW_LLM_STREAM=false`** if you need non-streaming.
+Crew waits on **`GET /v1/models`** (see **`CREW_VLLM_WAIT_S`** / **`CREW_VLLM_POLL_S`** in **`.env`**). **`CREW_LLM_STREAM=true`** (default) uses SSE through the gateway.
 
-**Flow:** CrewAI → gateway **:8765** → tunnel → vLLM on Lambda. Model name **`texttinyllama`** must match **`--served-model-name`** on the server.
-
----
-
-### Step 13 — What “full metrics” means (read this once)
-
-- **Gateway** — **`http://127.0.0.1:9101/metrics`**: `llm_gateway_*` with `technique` + `server_profile`, latency, tokens, estimated $.
-- **vLLM** — **`http://127.0.0.1:8000/metrics`** (via tunnel): engine metrics; names vary by vLLM version.
-- **JSONL** — default **`logs/gateway/*.jsonl`** per request (disable with **`GATEWAY_METRICS_LOG_DIR=-`**).
-
-Prometheus and Grafana are **Docker** images only (no `pip install` for them).
-
-**Labels:** `crew.py --technique` sets **`X-Technique`**. **`VLLM_SERVER_PROFILE`** in **`.env`** tags which **vLLM config** you think is live — change it and **restart the gateway** after you change **`vllm serve`** so Grafana can separate runs.
+**Path:** Crew → nginx **8780** → gateway **8765** → tunnel → vLLM. Model name **`texttinyllama`** must match **`--served-model-name`**.
 
 ---
 
-### Step 14 — Start Prometheus + Grafana (Docker)
+### Step 15 — What “full metrics” means (read once)
+
+Gateway Prometheus text is at **`http://127.0.0.1:9101/metrics`** (`llm_gateway_*` with **`technique`** and **`server_profile`**). A readable summary lives on the gateway app: **`http://127.0.0.1:8765/metrics/summary`**. vLLM engine metrics are on **`http://127.0.0.1:8000/metrics`** via the tunnel. Per-request JSONL defaults to **`logs/gateway/*.jsonl`** (turn off with **`GATEWAY_METRICS_LOG_DIR=-`**). Grafana and Prometheus are Docker-only in this guide.
+
+**Labels:** **`crew.py --technique`** sets **`X-Technique`**. Set **`VLLM_SERVER_PROFILE`** in **`.env`** to match the vLLM you are running; restart **`python gateway.py`** after you change the server.
+
+After editing **`gateway.py`**, restart the gateway. Grafana is **Step 16**.
+
+---
+
+### Step 16 — Start Prometheus + Grafana (Docker)
 
 **Requirements:** Steps **6** (vLLM), **7** (tunnel), and **10** (gateway) are running so something answers on laptop **`127.0.0.1:8000`** and **`127.0.0.1:9101`**.
 
@@ -265,19 +267,11 @@ cd monitoring
 docker compose up -d
 ```
 
-This starts:
+**Prometheus** is at **http://127.0.0.1:9090** and reads **`monitoring/prometheus.yml`**. It scrapes **`host.docker.internal:9101`** (gateway from Step **10**) and **`host.docker.internal:8000`** (vLLM through the tunnel). **Grafana** is at **http://127.0.0.1:3000** with the Prometheus datasource and dashboards already provisioned.
 
-- **Prometheus** at **http://127.0.0.1:9090** using **`monitoring/prometheus.yml`**, which scrapes **`host.docker.internal:9101`** (gateway) and **`host.docker.internal:8000`** (vLLM through the tunnel).
-- **Grafana** at **http://127.0.0.1:3000** with the **Prometheus** datasource and dashboards **pre-provisioned** (no manual “Add data source” if you use this compose file).
+**Linux:** Compose adds **`host.docker.internal:host-gateway`** for Prometheus. If targets fail, update Docker or run Prometheus on the host.
 
-**Linux note:** The compose file sets **`extra_hosts: host.docker.internal:host-gateway`** on Prometheus so the same config works as on macOS. If a target still fails, confirm Docker is recent enough for **`host-gateway`**, or temporarily run Prometheus on the host instead of in Docker.
-
-**Sanity check — Prometheus targets**
-
-Open **http://127.0.0.1:9090/targets**. You want **`gateway`** and **`vllm_tunnel`** in **UP** state.
-
-- **DOWN on `gateway`:** Step 10 not running, wrong port, or firewall.
-- **DOWN on `vllm_tunnel`:** Step 6 or **7** not running, or vLLM not listening on **8000** on the instance.
+Open **http://127.0.0.1:9090/targets** and confirm **`gateway`** and **`vllm_tunnel`** are **UP**. If **`gateway`** is **DOWN**, Step **10** is not running or **9101** / **`prometheus.yml`** do not match. If **`vllm_tunnel`** is **DOWN**, fix Step **6** or **7** or confirm vLLM listens on **8000** on the instance.
 
 **Fallback without Compose** (two separate containers, from **repo root**):
 
@@ -294,7 +288,7 @@ With the fallback you must **add the Prometheus datasource manually** in Grafana
 
 ---
 
-### Step 15 — Open Grafana and use the dashboards
+### Step 17 — Open Grafana and use the dashboards
 
 1. Open **http://127.0.0.1:3000**.
 2. Log in as **`admin` / `admin`** and set a new password when prompted.
@@ -304,11 +298,11 @@ With the fallback you must **add the Prometheus datasource manually** in Grafana
 
 ---
 
-### Step 16 — Generate traffic so the graphs move
+### Step 18 — Generate traffic so the graphs move
 
 With Grafana open (time range **Last 1 hour** or **Last 15 minutes**):
 
-1. Run a chat via the gateway (Step 11 **`curl`** is enough), or **`python crew.py --technique baseline`** (Step 12).
+1. Send traffic with the Step **13** **`curl`** on **8780**, or run **`python crew.py --technique baseline`** (Step **14**).
 2. Wait one or two **Prometheus scrape intervals** (15s in **`prometheus.yml`**).
 3. Refresh **TinyLlama — GPU, runs & cost** (or wait for auto-refresh).
 
@@ -318,7 +312,7 @@ With Grafana open (time range **Last 1 hour** or **Last 15 minutes**):
 
 ---
 
-### Step 17 — Different vLLM engine settings (A/B)
+### Step 19 — Different vLLM engine settings (A/B)
 
 Engine flags are documented in [vLLM engine arguments](https://docs.vllm.ai/en/stable/configuration/engine_args/). **`crew.py --technique`** sets **`X-Technique`**; with **`VLLM_AUTO_ENGINE_ROUTING=1`** the gateway maps **`baseline`**, **`chunked_prefill`**, **`prefix_caching`**, **`chunked_prefill_and_prefix_caching`**, **`baseline_strict`**, **`speculative_decoding`**, and **`beam_search`** (same upstream as baseline) to **ports** **8000–8005** derived from **`VLLM_BASE_URL`** (see Step 6 / **`.env.example`**). Run the fleet on the GPU host, multi-port tunnel on the laptop, then e.g. **`python crew.py --technique chunked_prefill`**.
 
@@ -363,14 +357,9 @@ Use **`VLLM_SERVE_PORT=8001`** (etc.) in front of any single-script line when yo
 
 ---
 
-### Step 18 — Monitoring troubleshooting
+### Step 20 — Monitoring troubleshooting
 
-- **Targets DOWN** — Steps 6–7–10; `curl -sS http://127.0.0.1:9101/metrics` and `curl -sS http://127.0.0.1:8000/metrics`.
-- **Grafana empty** — Widen time range; in Prometheus **Graph** try `llm_gateway_requests_total`.
-- **No `llm_gateway_*`** — Restart gateway from current **`gateway.py`** (9101 opens on app startup).
-- **9101 refused** — Port in use or old process; **`8765/metrics`** may still work.
-- **vLLM panels empty** — Metric renames; explore **`{job="vllm_tunnel"}`** in Prometheus.
-- **Port / duplicate containers** — `cd monitoring && docker compose down` or `docker rm -f prom graf`.
+Targets **DOWN**: confirm Steps **6**, **7**, and **10**, then `curl -sS http://127.0.0.1:9101/metrics` and `curl -sS http://127.0.0.1:8000/metrics`. **Grafana empty**: widen the time range; in Prometheus **Graph** try **`llm_gateway_requests_total`**. **No `llm_gateway_*`**: restart **`python gateway.py`**. **9101 refused**: free the port or change **`GATEWAY_METRICS_PORT`**. **vLLM panels empty**: check **`{job="vllm_tunnel"}`** in Prometheus for renamed metrics. **Duplicate containers**: `cd monitoring && docker compose down` or `docker rm -f prom graf`.
 
 ---
 
@@ -380,18 +369,20 @@ Use **`VLLM_SERVE_PORT=8001`** (etc.) in front of any single-script line when yo
 2. **`nvidia-smi` not found on Lambda** — Wrong instance type or image; redo Step 3 with a **GPU** SKU and **Lambda Stack**.
 3. **`libcuda` / device errors in Python on Lambda** — Same as (2); GPU not visible.
 4. **`connection refused` on laptop `127.0.0.1:8000`** — Step 6 not running, or Step 7 tunnel not running, or vLLM not bound to `0.0.0.0:8000`.
-5. **`connection refused` on `127.0.0.1:8765`** — Step 10 not running or wrong directory/env.
-6. **Gateway `/health` not `"ok"`** — Fix `VLLM_BASE_URL` in `.env` (must be tunnel URL **`http://127.0.0.1:8000`** for this guide).
-7. **`Failed to export traces … 4317`** — Start Jaeger (optional section below) or set **`OTEL_TRACES_EXPORTER=none`** in `.env`.
-8. **Crew LLM errors** — Run Step 11 **`/v1/models`** through the gateway; ensure tunnel and vLLM are up.
-9. **`apt full-upgrade` errors on Lambda Stack 24.04** — Known Lambda caveat; see [Lambda base images / troubleshooting](https://docs.lambda.ai/public-cloud/on-demand/#base-images).
-10. **Grafana empty / Prometheus targets red** — **Step 18**; confirm **`docker compose`** from **`monitoring/`** and that Steps **6–7–10** are running.
+5. **`connection refused` on `127.0.0.1:8765`** — Step **10** not running or wrong directory/env.
+6. **`connection refused` on `127.0.0.1:8780`** — Step **12** (nginx) not running or wrong **`nginx -c`** path.
+7. **`502` from `127.0.0.1:8780`** — nginx is up but nothing on **8765**; start Step **10** or fix **`upstream`** in **`nginx-gateway-lb.conf`**.
+8. **Gateway `/health` not `"ok"`** — Fix **`VLLM_BASE_URL`** in **`.env`** (**`http://127.0.0.1:8000`** with the tunnel).
+9. **`Failed to export traces … 4317`** — Start Jaeger (optional below) or set **`OTEL_TRACES_EXPORTER=none`** in **`.env`**.
+10. **Crew LLM errors** — Run Step **13** **`curl …/v1/models`** on **8780** (or Step **11** on **8765** without nginx); confirm tunnel and vLLM.
+11. **`apt full-upgrade` errors on Lambda Stack 24.04** — Known Lambda caveat; see [Lambda base images / troubleshooting](https://docs.lambda.ai/public-cloud/on-demand/#base-images).
+12. **Grafana empty / Prometheus targets red** — **Step 20**; run **`docker compose`** from **`monitoring/`** and keep Steps **6–7–10** running.
 
 ---
 
 ## Optional: OpenTelemetry traces (Jaeger)
 
-Separate from Prometheus (request spans, not histograms). Same **Docker** dependency as Step 14.
+Separate from Prometheus (request spans, not histograms). Same **Docker** dependency as Step **16**.
 
 ```bash
 docker run -d --name jaeger -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one:latest
@@ -418,198 +409,5 @@ docker run --gpus all --ipc=host -p 8000:8000 \
 Pin a tag from [Docker Hub](https://hub.docker.com/r/vllm/vllm-openai) instead of `:latest` if you want a fixed version. Use **`docker run -d`** to keep the server running after you disconnect (see Docker docs for logs).
 
 Then continue from **Step 7** unchanged.
-
----
-
-## Architecture
-
-### End-to-end flow (README order)
-
-Step numbers match the **Steps** sections above. Solid lines: request path and Prometheus scrape path. Dashed: optional traces.
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'background': '#ffffff', 'primaryTextColor': '#1a1a1a', 'lineColor': '#455a64', 'fontFamily': 'system-ui, sans-serif'}}}%%
-flowchart TB
-  subgraph LM["Lambda GPU instance — Steps 4 → 6"]
-    direction TB
-    S45["Steps 4–5 · SSH in · nvidia-smi"]
-    S6["Step 6 · vllm serve on :8000<br/>or run_engine_fleet.sh :8000–8005"]
-    S45 --> S6
-  end
-
-  subgraph LP["Your laptop"]
-    direction TB
-    S13["Steps 1–3 · SSH key · launch instance"]
-    S9["Step 9 · clone repo · .env · pip install"]
-    S7["Step 7 · ssh -L … tunnel<br/>127.0.0.1:8000* → instance"]
-    S10["Step 10 · python gateway.py<br/>:8765 OpenAI proxy · :9101 metrics"]
-    S12["Step 12 · python crew.py --technique<br/>sends X-Technique"]
-    S11["Step 11 · curl /v1/models — sanity check"]
-
-    S13 --> S9
-    S9 --> S7
-    S9 --> S10
-    S12 -->|"POST /v1/… + X-Technique"| S10
-    S11 --> S10
-
-    subgraph DK["Docker on laptop — Steps 13–18 optional"]
-      direction TB
-      S13b["Step 13–14 · docker compose up"]
-      PR["Prometheus :9090"]
-      GF["Grafana :3000"]
-      S13b --> PR
-      PR -->|"query"| GF
-    end
-  end
-
-  S6 <-->|"SSH -L forwards API + /metrics"| S7
-  S10 -->|"upstream to 127.0.0.1:8000+"| S7
-
-  S10 --> MGW["gateway /metrics :9101"]
-  MGW -->|"scrape host.docker.internal"| PR
-  S7 --> MV["vLLM /metrics on forwarded :8000+"]
-  MV -->|"scrape host.docker.internal"| PR
-
-  J["Jaeger optional — OpenTelemetry / Jaeger section"]
-  S12 -.->|"OTLP gRPC"| J
-  S10 -.->|"OTLP gRPC"| J
-
-  classDef lambda fill:#F3E5F5,stroke:#7B1FA2,stroke-width:2px,color:#4A148C
-  classDef laptop fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1
-  classDef docker fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20
-  classDef prom fill:#FFF3E0,stroke:#E65100,stroke-width:2px,color:#BF360C
-  classDef graf fill:#FCE4EC,stroke:#AD1457,stroke-width:2px,color:#880E4F
-  classDef metrics fill:#ECEFF1,stroke:#546E7A,stroke-width:2px,color:#37474F
-  classDef jaeger fill:#E0F7FA,stroke:#00838F,stroke-width:2px,color:#006064
-
-  class S45,S6 lambda
-  class S13,S9,S7,S10,S12,S11 laptop
-  class S13b docker
-  class PR prom
-  class GF graf
-  class MGW,MV metrics
-  class J jaeger
-```
-
-**Auto engine routing (Step 6 / 17):** with **`VLLM_AUTO_ENGINE_ROUTING=1`**, the gateway maps **`--technique`** to different **localhost ports**; the tunnel must forward each **8000–8005** you use. **Beam search** stays one server: the gateway injects **`use_beam_search`** on the JSON body.
-
-### Engine fleet and scaling (compared)
-
-**Engine fleet** means **several `vllm serve` processes** on **one** cloud GPU instance (different ports, different engine flags). That is **not** horizontal scaling — you still have a **single VM** sharing **one** GPU’s VRAM.
-
-#### Engine fleet — one instance, multiple vLLM servers
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'background': '#ffffff', 'primaryTextColor': '#1a1a1a', 'lineColor': '#455a64', 'fontFamily': 'system-ui, sans-serif'}}}%%
-flowchart LR
-  GW([Gateway / laptop<br/>routes by X-Technique]):::gw
-  subgraph FLEET["Single GPU VM — engine fleet"]
-    direction TB
-    V0([vLLM :8000]):::vllm
-    V1([vLLM :8001]):::vllm
-    V2([vLLM :8002 …]):::vllm
-  end
-  GW --> V0
-  GW --> V1
-  GW --> V2
-
-  classDef gw fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20
-  classDef vllm fill:#F3E5F5,stroke:#7B1FA2,stroke-width:2px,color:#4A148C
-```
-
-#### Horizontal scaling — more instances (scale out)
-
-Add **separate** GPU VMs; a **load balancer** or **smart gateway** sends traffic to instance A, B, C… Each box usually runs **one** vLLM (same config) to add **throughput** and **isolation**.
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'background': '#ffffff', 'primaryTextColor': '#1a1a1a', 'lineColor': '#455a64', 'fontFamily': 'system-ui, sans-serif'}}}%%
-flowchart LR
-  LB([LB or gateway<br/>fan-out]):::gw
-  subgraph A["GPU instance A"]
-    VA([vLLM]):::vllm
-  end
-  subgraph B["GPU instance B"]
-    VB([vLLM]):::vllm
-  end
-  subgraph C["GPU instance C"]
-    VC([vLLM]):::vllm
-  end
-  LB --> VA
-  LB --> VB
-  LB --> VC
-
-  classDef gw fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20
-  classDef vllm fill:#F3E5F5,stroke:#7B1FA2,stroke-width:2px,color:#4A148C
-```
-
-#### Vertical scaling — bigger GPU on one instance (scale up)
-
-Keep **one** VM; move to a **larger SKU** (more VRAM / faster GPU). Still typically **one** vLLM process — you get **headroom**, not extra machines.
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'background': '#ffffff', 'primaryTextColor': '#1a1a1a', 'lineColor': '#455a64', 'fontFamily': 'system-ui, sans-serif'}}}%%
-flowchart LR
-  SM([Smaller GPU VM<br/>one vLLM]):::small
-  LG([Larger GPU VM<br/>one vLLM · more VRAM]):::big
-  SM -->|"vertical scale<br/>(resize / new SKU)"| LG
-
-  classDef small fill:#ECEFF1,stroke:#546E7A,stroke-width:2px,color:#37474F
-  classDef big fill:#F3E5F5,stroke:#7B1FA2,stroke-width:2px,color:#4A148C
-```
-
----
-
-### Components and data paths
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'background': '#ffffff', 'primaryTextColor': '#1a1a1a', 'lineColor': '#455a64', 'fontFamily': 'system-ui, sans-serif'}}}%%
-flowchart LR
-  Crew([CrewAI laptop]):::crew
-  GW([Gateway :8765]):::gw
-  TUN([SSH tunnel :8000]):::tunnel
-  VLLM([vLLM Lambda]):::vllm
-  MGW([Gateway metrics :9101]):::metrics
-  MV([vLLM metrics :8000]):::metrics
-  Prom([Prometheus :9090]):::prom
-  Graf([Grafana :3000]):::graf
-  J([Jaeger optional]):::jaeger
-
-  Crew --> GW
-  GW --> TUN
-  TUN --> VLLM
-  GW --> MGW
-  VLLM --> MV
-  MGW --> Prom
-  MV --> Prom
-  Prom --> Graf
-  Crew --> J
-  GW --> J
-
-  classDef crew fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1
-  classDef gw fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20
-  classDef tunnel fill:#FFF8E1,stroke:#F9A825,stroke-width:2px,color:#E65100
-  classDef vllm fill:#F3E5F5,stroke:#7B1FA2,stroke-width:2px,color:#4A148C
-  classDef metrics fill:#ECEFF1,stroke:#546E7A,stroke-width:2px,color:#37474F
-  classDef prom fill:#FFF3E0,stroke:#E65100,stroke-width:2px,color:#BF360C
-  classDef graf fill:#FCE4EC,stroke:#AD1457,stroke-width:2px,color:#880E4F
-  classDef jaeger fill:#E0F7FA,stroke:#00838F,stroke-width:2px,color:#006064
-```
-
-**Metrics vs traces:** Samples flow **gateway / vLLM** → **Prometheus** → **Grafana** (pull + query). **Jaeger** receives **OTLP traces** from Crew and the gateway only. The Compose stack provisions **Prometheus** for Grafana; dashboards **link** out to the Jaeger UI for traces.
-
----
-
-## Repo files (quick reference)
-
-- **`gateway.py`** — Proxy, Prometheus (`llm_gateway_*`), OTel, cost estimate, beam injection, optional **`VLLM_AUTO_ENGINE_ROUTING`** to engine-fleet ports.
-- **`crew.py`** — Crew workflow, **`--technique`**, upstream wait, OTLP flush.
-- **`lambda_pricing.py`** — Optional Lambda API hourly price for cost metrics.
-- **`scripts/run_experiments.sh`** — Run crew once per technique label (client labels only).
-- **`scripts/vllm_engine/*.sh`** — **`vllm serve`** one-liners with different [engine args](https://docs.vllm.ai/en/stable/configuration/engine_args/) (baseline, chunked prefill, prefix cache, speculative, …); **`run_engine_fleet.sh`** starts the full set on **8000–8005** for **`VLLM_AUTO_ENGINE_ROUTING`** in **`gateway.py`**.
-- **`scripts/run_server_ab.sh`** + **`scripts/ab_arms.sh`** — Drive Crew after each arm; **`ab_arms.sh`** HINTs point at **`vllm_engine/`** scripts.
-- **`monitoring/docker-compose.yml`** — Prometheus + Grafana with datasource and dashboard provisioning.
-- **`monitoring/prometheus.yml`** — Scrape **gateway** and **vLLM** on the laptop (tunnel + **`host.docker.internal`**).
-- **`monitoring/grafana/provisioning/`** — Auto-add Prometheus datasource when using Compose.
-- **`monitoring/grafana_dashboards/`** — Dashboard JSON (import manually if you use raw **`docker run`** for Grafana only).
 
 ---

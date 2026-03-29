@@ -30,13 +30,33 @@ from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExport
 SERVED = os.environ.get("MODEL_NAME", "texttinyllama")
 GATEWAY = os.environ.get("GATEWAY_OPENAI_BASE") or os.environ.get("OPENAI_API_BASE")
 if not GATEWAY:
-    host = os.environ.get("GATEWAY_HOST", "127.0.0.1")
-    port = os.environ.get("GATEWAY_PORT", "8765")
-    GATEWAY = f"http://{host}:{port}/v1"
+    use_lb = os.environ.get("GATEWAY_USE_LOAD_BALANCER", "true").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+    if use_lb:
+        host = os.environ.get("GATEWAY_LB_HOST", "127.0.0.1")
+        port = os.environ.get("GATEWAY_LB_PORT", "8780")
+        GATEWAY = f"http://{host}:{port}/v1"
+    else:
+        host = os.environ.get("GATEWAY_HOST", "127.0.0.1")
+        port = os.environ.get("GATEWAY_PORT", "8765")
+        GATEWAY = f"http://{host}:{port}/v1"
 if GATEWAY.rstrip("/").endswith("/v1"):
     pass
 else:
     GATEWAY = GATEWAY.rstrip("/") + "/v1"
+
+
+def _gateway_health_url() -> str:
+    g = GATEWAY.rstrip("/")
+    if g.endswith("/v1"):
+        root = g[: -len("/v1")]
+    else:
+        root = g
+    return root.rstrip("/") + "/health"
 
 OTEL_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") or os.environ.get(
     "OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317"
@@ -62,10 +82,8 @@ def _crew_llm_stream_enabled() -> bool:
 
 
 def _exit_if_gateway_shows_bad_vllm_url() -> None:
-    host = os.environ.get("GATEWAY_HOST", "127.0.0.1")
-    port = os.environ.get("GATEWAY_PORT", "8765")
     try:
-        with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=5) as resp:
+        with urllib.request.urlopen(_gateway_health_url(), timeout=5) as resp:
             body = json.loads(resp.read().decode())
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return

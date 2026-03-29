@@ -1,6 +1,4 @@
-# shellcheck shell=bash
-# Template: copy to ab_arms.sh or merge arms. Engine launchers: scripts/vllm_engine/
-# https://docs.vllm.ai/en/stable/configuration/engine_args/
+
 
 AB_CREW_TECHNIQUE="${AB_CREW_TECHNIQUE:-baseline}"
 
